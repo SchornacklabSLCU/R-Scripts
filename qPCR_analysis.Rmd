@@ -1,0 +1,701 @@
+---
+title: "qPCR analysis DeltaCp: boxplots with Tukey HSD letters"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+params:
+  input_file: "sample_data_genotype_timepoint.txt"
+  n_ref_genes: 2
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.align = "center", dpi = 150)
+```
+
+# What this report does
+
+This script automates qPCR data analysis and gives boxplots as outputs.
+It is modified from a script from Edouard Evangelisti from 2019 to include boxplots, genotypes in colours, Tukey HSD
+letters, and separate experiment and biological-replicate columns.
+
+For every gene of interest (GOI) the analysis:
+
+1. **Averages technical replicates** (rows with the same sample / D2 / experiment / biological replicate).
+2. **Computes expression relative to the reference gene(s)**:
+   `ratio = GeoMean[ E_ref ^ Cp_ref ] / ( E_goi ^ Cp_goi )`
+   (Vandersompele et al. 2002; E = efficiency, or slope if `EFFICIENCY_IS_SLOPE` is `TRUE`).
+3. **Draws a boxplot per gene**:
+    - one colour per sample/genotype (colour-blind-friendly palette);
+    - if a D2 column (e.g. timepoint) is present, the D2 groups (t1, t2) are on the x axis and the genotypes are side by side, coloured, within each group; without D2, each genotype is its own box on the x axis;
+    - every individual ratio (one per experiment x biological replicate) is overlaid as a point. All points are open shapes: each experiment has its own shape (circle, square, triangle, ...), and biological replicates of the same experiment share that shape (they only get slightly different horizontal positions so that points do not overlap);
+    - letters from Tukey's HSD post-hoc test above each box.
+4. **Writes** one image per gene and one multi-panel image (all genes), a statistics report per gene, and text tables to `OUTPUT_DIR`. The same results are also shown in this report.
+
+## Terminology
+
+| Term | Meaning |
+|------|---------|
+| Technical replicate | The same cDNA measured several times. Rows that share sample / D2 / Exp / Bio. Simply averaged. |
+| Biological replicate | Independent biological sample (column `Bio`). |
+| Experiment (Exp) | One complete repetition of the whole experiment (column `Exp`). Treated as a **block** in the statistics. |
+
+Biological replicate numbers are labels within an experiment: Bio 1 of Exp 1
+and Bio 1 of Exp 2 are different, independent samples. Each (Exp, Bio)
+combination gives **one** data point per group and gene.
+
+## A note on the statistics
+
+* Tests are run on **log2(ratio)**, while the plot shows the raw ratios (or a
+  log2 axis if `Y_AXIS_LOG2` is `TRUE`). Reason: ratios are built from E^Cp terms,
+  so they are multiplicative: right-skewed, with a spread that grows with the
+  mean. ANOVA/Tukey assume roughly normal residuals with similar variance in
+  every group; the log transformation makes these assumptions far more
+  plausible (a difference on the log2 scale is a fold change). The letters on
+  the plot therefore refer to differences in fold change, even when the axis is
+  linear.
+* Per gene, **all groups are compared against each other in one test**: with a
+  D2 column the groups are every sample x D2 combination (e.g. "genotype1 t1").
+  Method: ANOVA with experiment as a blocking factor
+  (`log2 ratio ~ experiment + group`), then Tukey HSD, all pairwise comparisons,
+  alpha = `ALPHA`. Blocking removes the shift between experiments (batch
+  effect) from the residual error. With a single experiment the model is a
+  plain one-way ANOVA. The model is additive (no experiment x group term).
+* **Letters:** groups sharing a letter are *not* significantly different.
+  Letters are assigned so that "a" goes to the group with the highest mean.
+* The statistics report also contains a Shapiro-Wilk test of the ANOVA
+  residuals and (as a cross-check that *ignores* the experiment block)
+  Kruskal-Wallis with Nemenyi post-hoc test.
+* Genes are tested independently; there is no correction across genes.
+
+# Requirements
+
+Required R packages (all on CRAN):
+
+| Package | Description |
+|---------|-------------|
+| `rmarkdown`, `knitr` | Rendering this report. |
+| `ggplot2` | Graphics. |
+| `multcompView` | Compact letter display from pairwise p-values. |
+| `svglite` | (optional) only needed for `GRAPH_EXPORT_FORMAT = "SVG"`. |
+| `PMCMRplus` | (optional) Nemenyi post-hoc test in the statistics report. |
+
+```r
+install.packages(c("rmarkdown", "knitr", "ggplot2", "multcompView", "svglite", "PMCMRplus"))
+```
+
+# Input file format
+
+Tab-delimited text (change `DELIMITER` in the settings for other separators).
+One row per technical replicate. Columns:
+
+```
+Sample  [D2]  Bio  Exp  REF1  REF2 ...  GENE1  GENE2 ...
+```
+
+* The header must contain the column names `Bio` and `Exp` (any
+  capitalisation), side by side (Exp before Bio also works). The Sample column
+  name is free. D2 is **optional**; if used it must be named `D2` and be the 2nd
+  column (e.g. dpi, dose, treatment).
+* Reference genes come **first** (set how many with `n_ref_genes`), then genes of interest.
+* The first row below the header holds the efficiencies (or slopes) in the gene
+  columns; leave the label columns of that row empty.
+* Sample names can be anything (genotypes, treatments, ...).
+* Missing values: leave empty or write `NA`.
+* At most 5 experiments (one open shape each, see `EXP_SHAPES`); any number of
+  biological replicates.
+
+```
+Sample     D2  Bio  Exp  MpEF1a  MpACT  PpEF1a  PpCdc14
+                        1.97    1.95   2       2          <- efficiencies
+genotype1  t1  1    1    16.26   19.55  22.62   27.67      <- technical rep 1
+genotype1  t1  1    1    16.27   19.47  22.64   27.63      <- technical rep 2
+genotype1  t1  1    1    16.46   19.63  22.58   27.57      <- technical rep 3
+genotype1  t1  2    1    ...                                <- Bio 2, Exp 1
+genotype1  t1  3    1    ...
+genotype1  t1  1    2    ...                                <- Bio 1, Exp 2
+...
+genotype2  t2  3    3    ...
+```
+
+Without D2 simply omit that column: `Sample  Bio  Exp  genes...`
+
+## Test dataset: `sample_data_genotype_timepoint.txt`
+
+Simulated data that follows the format above and is used throughout this
+description:
+
+* 2 genotypes ("genotype1", "genotype2") = Sample column
+* 2 timepoints ("t1", "t2") = D2 column
+* 3 experiments x 3 biological replicates x 3 technical replicates
+* 2 reference genes (MpEF1a, MpACT) + 2 genes of interest (PpEF1a, PpCdc14)
+* 2 x 2 x 3 x 3 x 3 = 108 data rows
+
+Run it with `n_ref_genes = 2`. Each gene then has 4 groups (2 genotypes x 2
+timepoints) with 9 values each (3 experiments x 3 biological replicates).
+
+Expected outcome (sanity check). Simulated mean expression ratios:
+
+| Gene | Genotype | t1 | t2 |
+|------|----------|----|----|
+| PpEF1a | genotype1 | ~0.02 | ~0.4 |
+| PpEF1a | genotype2 | ~0.02 | ~0.2 |
+| PpCdc14 | genotype1 | ~0.001 | ~0.06 |
+| PpCdc14 | genotype2 | ~0.001 | ~0.02 |
+
+Both genes start at similar levels at t1 and rise at t2, more strongly in
+genotype1. Tukey letters (a = highest): genotype1 t2 "a", genotype2 t2 "b", and
+both t1 groups share "c" (for both genes).
+
+# How to use
+
+1. Install the required packages (see above).
+2. Prepare the input file (see above). To try the report first, use the test
+   dataset `sample_data_genotype_timepoint.txt`.
+3. Put this `.Rmd` file and the input file in the same folder.
+4. Set the input file name and number of reference genes, either in the YAML
+   header (`params:` at the top of this file) or when knitting:
+
+   ```r
+   rmarkdown::render("qPCR_boxplots.Rmd",
+                     params = list(input_file = "my_data.txt", n_ref_genes = 2))
+   ```
+
+   In RStudio you can also use *Knit > Knit with Parameters...*. (An Rmd cannot
+   ask questions while it renders, so there are no prompts.)
+5. Adjust any other setting in the *Settings* chunk below.
+6. Knit. The HTML report shows the tables, statistics and plots; the output
+   files (images, statistics text files, tables) are written to `OUTPUT_DIR`,
+   next to the `.Rmd`. Click *Code* buttons in the report to show the code.
+
+# Settings
+
+```{r settings}
+# --- Input ---------------------------------------------------------------------
+INPUT_FILE <- params$input_file     # Set in the YAML header or at knit time.
+N_REF_GENES <- params$n_ref_genes   # Number of reference genes (same).
+DELIMITER <- "\t"                   # Input file delimiter (tab/comma).
+EFFICIENCY_IS_SLOPE <- FALSE        # TRUE if row 1 gives standard-curve slopes.
+
+# --- Plot ----------------------------------------------------------------------
+# Colours for the samples/genotypes, in order of first appearance in the file.
+# NULL = colour-blind-friendly Okabe-Ito palette. Or give a vector of colours,
+# optionally named by sample, e.g. c(genotype1 = "#0072B2", genotype2 = "#D55E00").
+GENOTYPE_COLOURS <- NULL
+Y_AXIS_LOG2 <- FALSE                # TRUE = log2 y axis (statistics unaffected).
+DRAW_ACTUAL_VALUES <- TRUE          # Overlay individual ratios.
+POINT_SIZE <- 2.2                   # Size of the overlaid points.
+# Open point shape for experiment 1, 2, 3, ... (circle, square, triangle,
+# diamond, inverted triangle). Biological replicates share their experiment's shape.
+EXP_SHAPES <- c(1, 0, 2, 5, 6)
+BOX_CLUSTER_WIDTH <- 0.8            # Width of one x-axis group (max 1).
+BOX_FILL_ALPHA <- 0.85              # Box transparency (1 = opaque).
+PRINT_GRAPH_TITLE <- TRUE           # Show/hide graph title.
+GRAPH_TITLE <- "*"                  # '*' stands for the gene name.
+SPLIT_GENE_ID_ALIAS <- TRUE         # Gene "ID.Alias": title = ID, file = Alias.
+LEGEND_TITLE_SAMPLE <- "Genotype"   # Legend title for colours.
+LEGEND_TITLE_REPEAT <- "Experiment" # Legend title for point shapes.
+X_AXIS_TITLE <- ""                  # X axis label.
+Y_AXIS_TITLE <- "Expression level_relative to *"  # '*' = reference gene(s);
+                                                  # '_' = line break.
+DRAW_LEGEND <- TRUE                 # Show/hide legend.
+LEGEND_POS <- "right"               # "right", "top", "bottom", "left", "none".
+FONT_SIZE <- 14                     # Base font size.
+LETTER_SIZE <- 5                    # Size of the Tukey letters.
+NOT_DETECTED <- "n.d."              # Text for groups without any value.
+
+# --- Statistics ----------------------------------------------------------------
+RUN_STATS_ANALYSIS <- TRUE          # Perform statistical analysis.
+ALPHA <- 0.05                       # Significance level for Tukey HSD.
+DRAW_LETTERS <- TRUE                # Draw Tukey letters on the plots.
+BLOCK_BY_EXPERIMENT <- TRUE         # Include experiment as a blocking factor.
+
+# --- Output files (the report itself also shows everything) --------------------
+OUTPUT_DIR <- "*"                   # Use "*" for automatic naming.
+MEAN_CP_OUTPUT_FILE <- "Mean_Cp.txt"      # Mean Cp per sample/experiment/bio. rep.
+RATIOS_OUTPUT_FILE <- "Ratios.txt"        # Ratios per sample/experiment/bio. rep.
+MEAN_RATIOS_OUTPUT_FILE <- "M_ratios.txt" # Mean ratio per group.
+SE_OUTPUT_FILE <- "SE_ratios.txt"         # Standard error per group.
+LETTERS_OUTPUT_FILE <- "Tukey_letters.txt" # Letters for all genes.
+GRAPH_EXPORT_FORMAT <- "SVG"        # Saved images: "JPEG", "PNG", "SVG" or "PDF".
+DRAW_SINGLE_PLOTS <- TRUE           # One plot per gene.
+DRAW_MULTIPANEL <- TRUE             # One plot with a panel per gene.
+MULTIPANEL_COLS <- 2                # Number of panel columns.
+MULTIPANEL_FREE_Y <- TRUE           # Independent y axis for each panel.
+FIG_WIDTH <- 6.5                    # Single plot width (inches).
+FIG_HEIGHT <- 5                     # Single plot height (inches).
+PANEL_WIDTH <- 5                    # Width of one panel in the multi-panel plot.
+PANEL_HEIGHT <- 4                   # Height of one panel in the multi-panel plot.
+FIG_DPI <- 300                      # Resolution of saved JPEG/PNG files.
+```
+
+# Analysis
+
+## Load packages and helper functions
+
+```{r libraries}
+SCRIPT_HEADER <- "[qPCR_boxplots]"
+
+for (lib in c("ggplot2", "multcompView")) {
+  if (!requireNamespace(lib, quietly = TRUE))
+    stop("Package '", lib, "' is required. Install it with install.packages(\"", lib, "\")")
+}
+library(ggplot2)
+HAS_PMCMR <- requireNamespace("PMCMRplus", quietly = TRUE)
+
+if (OUTPUT_DIR == "*") OUTPUT_DIR <- paste0("qPCR_", gsub(" +|:", "_", date()))
+
+IPO.Joker <- function(t, str) gsub("*", str, t, fixed = TRUE)
+IPO.GeoMean <- function(x) exp(mean(log(x)))     # NA if any value is NA.
+# Unique values, sorted numerically when they are all numbers.
+IPO.SortLevels <- function(x) {
+  u <- unique(x)
+  n <- suppressWarnings(as.numeric(u))
+  if (!any(is.na(n))) u[order(n)] else u
+}
+
+IPO.SplitGeneName <- function(str) {
+  if (SPLIT_GENE_ID_ALIAS) unlist(strsplit(str, split = ".", fixed = TRUE)) else str
+}
+IPO.GeneTitle <- function(gene) IPO.SplitGeneName(gene)[1]
+IPO.GeneFile  <- function(gene) tail(IPO.SplitGeneName(gene), 1)
+```
+
+## Read the input file
+
+```{r read-data}
+if (is.null(INPUT_FILE) || !file.exists(INPUT_FILE))
+  stop("Input file \"", INPUT_FILE, "\" does not exist. Set `input_file` in the YAML header",
+       " or when knitting, and make sure the file is in the same folder as this .Rmd.")
+file <- INPUT_FILE
+
+REF.num <- N_REF_GENES
+if (is.null(REF.num) || is.na(REF.num) || REF.num < 1)
+  stop("At least one reference gene is required (set `n_ref_genes`).")
+
+Raw <- read.table(file, sep = DELIMITER, header = TRUE, stringsAsFactors = FALSE,
+                  na.strings = c("NA", ""), strip.white = TRUE, comment.char = "",
+                  quote = "\"")
+COL <- colnames(Raw)
+IPO.HasDIM2 <- COL[2] == "D2"
+
+# Format: Sample [D2] Bio Exp genes... (Exp/Bio in either order)
+bio.col <- which(tolower(COL) == "bio")
+exp.col <- which(tolower(COL) == "exp")
+IPO.NewFormat <- length(bio.col) == 1 && length(exp.col) == 1
+if (IPO.NewFormat) {
+  n.lab <- if (IPO.HasDIM2) 4 else 3
+  if (!setequal(c(bio.col, exp.col), c(n.lab - 1, n.lab)))
+    stop("Expected columns: Sample, ", if (IPO.HasDIM2) "D2, " else "", "Bio, Exp, <genes>. Found: ",
+         paste(COL[1:min(length(COL), n.lab + 1)], collapse = ", "))
+} else {
+  n.lab <- if (IPO.HasDIM2) 3 else 2
+  cat(SCRIPT_HEADER, "No 'Exp'/'Bio' columns found: reading the repeat column as biological",
+      "replicates of a single experiment.\n")
+}
+gene.cols <- (n.lab + 1):ncol(Raw)
+ALL <- COL[gene.cols]
+if (REF.num >= length(ALL)) stop("Number of reference genes must be smaller than the number of genes.")
+REF <- ALL[seq_len(REF.num)]
+GOI <- ALL[-seq_len(REF.num)]
+
+# Row 1 = efficiencies; remaining rows = data.
+eff <- as.numeric(unlist(Raw[1, gene.cols]))
+if (any(is.na(eff))) stop("Efficiency (row 1) is missing for: ", paste(ALL[is.na(eff)], collapse = ", "))
+if (EFFICIENCY_IS_SLOPE) eff <- 10^(-1 / eff)
+names(eff) <- ALL
+
+D <- Raw[-1, , drop = FALSE]
+D <- D[!is.na(D[[1]]), , drop = FALSE]          # Drop empty rows
+d <- data.frame(
+  sample = as.character(D[[1]]),
+  d2     = if (IPO.HasDIM2) as.character(D[[2]]) else "Single",
+  exp    = if (IPO.NewFormat) as.character(D[[exp.col]]) else "1",
+  bio    = as.character(D[[if (IPO.NewFormat) bio.col else n.lab]]),
+  stringsAsFactors = FALSE
+)
+for (g in seq_along(ALL)) d[[ALL[g]]] <- suppressWarnings(as.numeric(D[[gene.cols[g]]]))
+if (any(is.na(d$bio))) stop("Missing biological replicate number.")
+if (any(is.na(d$exp))) stop("Missing experiment number.")
+if (IPO.HasDIM2 && any(is.na(d$d2))) stop("Missing D2 value in column 2.")
+
+SMP  <- unique(d$sample)
+DIM2 <- unique(d$d2)
+EXPS <- IPO.SortLevels(d$exp)
+BIOS <- IPO.SortLevels(d$bio)
+SMP.num <- length(SMP); DIM2.num <- length(DIM2)
+EXP.num <- length(EXPS); BIO.num <- length(BIOS)
+GOI.num <- length(GOI)
+if (EXP.num > length(EXP_SHAPES)) stop("More experiments (", EXP.num, ") than shapes in EXP_SHAPES.")
+if (nrow(unique(d[, c("exp", "bio")])) < 2) stop("At least 2 experiment x biological replicate combinations are required.")
+```
+
+### Design summary
+
+```{r design-summary}
+design <- data.frame(
+  Item = c("Input file", "Reference genes", "Genes of interest", "Samples",
+           if (IPO.HasDIM2) "D2 groups", "Experiments", "Biological replicates",
+           "Data rows (technical replicates)"),
+  Value = c(file, paste(REF, collapse = ", "), paste(GOI, collapse = ", "),
+            paste(SMP, collapse = ", "),
+            if (IPO.HasDIM2) paste(DIM2, collapse = ", "),
+            paste(EXPS, collapse = ", "), paste(BIOS, collapse = ", "), nrow(d)))
+knitr::kable(design)
+knitr::kable(data.frame(Gene = ALL, Role = ifelse(ALL %in% REF, "reference", "gene of interest"),
+                        Efficiency = unname(eff)), digits = 3)
+```
+
+```{r colours}
+OKABE_ITO <- c("#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2",
+               "#D55E00", "#CC79A7", "#999999")
+if (is.null(GENOTYPE_COLOURS)) {
+  if (SMP.num > length(OKABE_ITO))
+    stop(SMP.num, " samples but only ", length(OKABE_ITO), " default colours; set GENOTYPE_COLOURS.")
+  SMP.col <- setNames(OKABE_ITO[seq_len(SMP.num)], SMP)
+} else if (!is.null(names(GENOTYPE_COLOURS))) {
+  if (!all(SMP %in% names(GENOTYPE_COLOURS))) stop("GENOTYPE_COLOURS lacks names for: ",
+    paste(setdiff(SMP, names(GENOTYPE_COLOURS)), collapse = ", "))
+  SMP.col <- GENOTYPE_COLOURS[SMP]
+} else {
+  if (length(GENOTYPE_COLOURS) < SMP.num) stop("GENOTYPE_COLOURS has fewer colours than samples.")
+  SMP.col <- setNames(GENOTYPE_COLOURS[seq_len(SMP.num)], SMP)
+}
+```
+
+## Mean Cp over technical replicates
+
+```{r mean-cp}
+mean.na <- function(x) if (all(is.na(x))) NA_real_ else mean(x, na.rm = TRUE)
+CTm <- aggregate(d[, ALL, drop = FALSE],
+                 by = list(sample = d$sample, d2 = d$d2, exp = d$exp, bio = d$bio),
+                 FUN = mean.na)
+# Order: D2 (file order), experiment, biological replicate, sample (file order)
+CTm <- CTm[order(match(CTm$d2, DIM2), match(CTm$exp, EXPS), match(CTm$bio, BIOS),
+                 match(CTm$sample, SMP)), ]
+rownames(CTm) <- NULL
+knitr::kable(head(CTm, 12), digits = 2,
+             caption = "Mean Cp per sample / experiment / biological replicate (first 12 rows; the full table is written to the output folder).")
+```
+
+## Expression ratios
+
+Ratio = GeoMean[E(REF)^Cp(REF)] / E(GOI)^Cp(GOI) (Vandersompele et al. 2002).
+
+```{r ratios}
+ref.part <- apply(CTm[, REF, drop = FALSE], 1, function(cp) IPO.GeoMean(eff[REF] ^ cp))
+Ratios <- CTm[, c("sample", "d2", "exp", "bio"), drop = FALSE]
+for (g in GOI) Ratios[[g]] <- ref.part / (eff[g] ^ CTm[[g]])
+
+# Long format for plotting and statistics
+long <- do.call(rbind, lapply(GOI, function(g) {
+  data.frame(gene = g, sample = Ratios$sample, d2 = Ratios$d2, exp = Ratios$exp,
+             bio = Ratios$bio, ratio = Ratios[[g]], stringsAsFactors = FALSE)
+}))
+long$log2ratio <- ifelse(is.na(long$ratio) | long$ratio <= 0, NA, log2(long$ratio))
+long$group <- if (IPO.HasDIM2) paste(long$sample, long$d2) else long$sample
+
+# Summary tables
+se <- function(x) { x <- x[!is.na(x)]; if (length(x) < 2) NA_real_ else sd(x) / sqrt(length(x)) }
+summ <- function(f) {
+  out <- unique(Ratios[, c("d2", "sample")])
+  out <- out[order(match(out$d2, DIM2), match(out$sample, SMP)), ]
+  for (g in GOI) out[[g]] <- mapply(function(s, p)
+    f(Ratios[[g]][Ratios$sample == s & Ratios$d2 == p]), out$sample, out$d2)
+  rownames(out) <- NULL
+  if (!IPO.HasDIM2) out$d2 <- NULL
+  out
+}
+VAL <- summ(mean.na)
+SEM <- summ(se)
+
+knitr::kable(VAL, digits = 4, caption = "Mean expression ratio per group.")
+knitr::kable(SEM, digits = 4, caption = "Standard error of the ratio per group.")
+```
+
+```{r write-tables}
+dir.create(OUTPUT_DIR, showWarnings = FALSE)
+IPO.Export <- function(filename, data) {
+  write.table(data, file = file.path(OUTPUT_DIR, filename), sep = "\t",
+              quote = FALSE, row.names = FALSE, na = "NA")
+}
+IPO.Export(MEAN_CP_OUTPUT_FILE, rbind(
+  cbind(sample = "Efficiency", d2 = NA, exp = NA, bio = NA, as.data.frame(t(eff))), CTm))
+IPO.Export(RATIOS_OUTPUT_FILE, Ratios)
+IPO.Export(MEAN_RATIOS_OUTPUT_FILE, VAL)
+IPO.Export(SE_OUTPUT_FILE, SEM)
+```
+
+## Statistics: ANOVA (experiment as block) + Tukey HSD on log2(ratio)
+
+```{r stats-function}
+# Returns a list with the letters table and a report (character vector).
+IPO.Stats <- function(gene) {
+  dat <- long[long$gene == gene, ]
+  dat$group <- factor(dat$group, levels = unique(dat$group))
+  rep.out <- character(0)
+  say <- function(...) rep.out <<- c(rep.out, paste0(...))
+  say.tbl <- function(x) rep.out <<- c(rep.out, capture.output(print(x)))
+  delim <- "\n------------------------------------\n"
+
+  say("Gene: ", gene)
+  say("Tests are run on log2(ratio). Groups: ", paste(levels(dat$group), collapse = ", "))
+  say(delim, "Input data (technical replicates already averaged)", delim)
+  say.tbl(dat[, c("group", "sample", "d2", "exp", "bio", "ratio", "log2ratio")])
+
+  ok <- dat[!is.na(dat$log2ratio), ]
+  ok$group <- droplevels(ok$group)
+  ok$exp <- factor(ok$exp)
+  n.grp <- nlevels(ok$group)
+  say(delim, "Number of values per group", delim)
+  say.tbl(table(ok$group))
+  if (n.grp < 2 || nrow(ok) <= n.grp) {
+    say(delim, "Not enough data for ANOVA (need >= 2 groups and replicated values).")
+    return(list(letters = NULL, report = rep.out))
+  }
+
+  # Safe ids sorted by decreasing mean => letter 'a' = highest mean.
+  gm <- tapply(ok$log2ratio, ok$group, mean)
+  ord <- names(sort(gm, decreasing = TRUE))
+  ids <- setNames(sprintf("g%03d", seq_along(ord)), ord)
+  ok$gid <- factor(ids[as.character(ok$group)], levels = ids)
+
+  use.block <- BLOCK_BY_EXPERIMENT && nlevels(ok$exp) > 1
+  fit <- if (use.block) aov(log2ratio ~ exp + gid, data = ok) else aov(log2ratio ~ gid, data = ok)
+  say(delim, "ANOVA (log2 ratio ~ ", if (use.block) "experiment + " else "", "group; gid = group)", delim)
+  say.tbl(summary(fit))
+  if (fit$df.residual < 1) {
+    say("\nNo residual degrees of freedom (every group has a single value): Tukey HSD not possible.")
+    return(list(letters = NULL, report = rep.out))
+  }
+  if (fit$df.residual >= 3 && sd(residuals(fit)) > 0) {
+    say(delim, "Shapiro-Wilk test of ANOVA residuals (p < ", ALPHA, " suggests non-normality)", delim)
+    say.tbl(shapiro.test(residuals(fit)))
+  }
+
+  tk <- TukeyHSD(fit, "gid", conf.level = 1 - ALPHA)$gid
+  tkp <- tk[, "p adj"]
+  # Translate ids back to group names for the report.
+  inv <- setNames(names(ids), ids)
+  pairs <- strsplit(rownames(tk), "-", fixed = TRUE)
+  tk.df <- data.frame(
+    comparison = vapply(pairs, function(p) paste(inv[p[1]], "vs", inv[p[2]]), ""),
+    diff_log2 = tk[, "diff"], lwr = tk[, "lwr"], upr = tk[, "upr"],
+    p_adj = tkp, row.names = NULL)
+  say(delim, "Tukey HSD post-hoc, all pairwise (diff = difference in log2 ratio, first minus second)", delim)
+  say.tbl(tk.df)
+
+  let <- multcompView::multcompLetters(setNames(tkp, rownames(tk)), threshold = ALPHA,
+                                       compare = "<")$Letters
+  # Relabel so that "a" belongs to the group with the highest mean, "b" to the
+  # next new group, and so on (multcompLetters does not guarantee this).
+  grp.rank <- as.integer(sub("^g", "", names(let)))          # 1 = highest mean
+  lt <- strsplit(unname(let), "")
+  syms <- unique(unlist(lt))
+  first <- vapply(syms, function(s) min(grp.rank[vapply(lt, function(x) s %in% x, NA)]), 1L)
+  last  <- vapply(syms, function(s) max(grp.rank[vapply(lt, function(x) s %in% x, NA)]), 1L)
+  syms <- syms[order(first, last)]
+  new.sym <- setNames(c(letters, LETTERS)[seq_along(syms)], syms)
+  let <- setNames(vapply(lt, function(x) paste(sort(new.sym[x]), collapse = ""), ""), names(let))
+  let.df <- data.frame(gene = gene, group = inv[names(let)], letter = unname(let),
+                       mean_log2 = as.numeric(gm[inv[names(let)]]),
+                       mean_ratio_geometric = 2^as.numeric(gm[inv[names(let)]]),
+                       row.names = NULL, stringsAsFactors = FALSE)
+  let.df <- let.df[order(-let.df$mean_log2), ]
+  say(delim, "Compact letter display (shared letter = not significantly different at alpha = ", ALPHA, ")", delim)
+  say.tbl(let.df)
+
+  # Non-parametric cross-check (ignores the experiment block)
+  say(delim, "Kruskal-Wallis (cross-check, on log2 ratio, ignores experiment)", delim)
+  say.tbl(kruskal.test(log2ratio ~ group, data = ok))
+  if (HAS_PMCMR) {
+    say(delim, "Nemenyi post-hoc (PMCMRplus)", delim)
+    nm <- tryCatch(PMCMRplus::kwAllPairsNemenyiTest(x = ok$log2ratio, g = ok$group, dist = "Tukey"),
+                   error = function(e) conditionMessage(e))
+    say.tbl(nm)
+  }
+  list(letters = let.df, report = rep.out)
+}
+```
+
+```{r stats-run}
+LET <- NULL
+STATS <- list()
+if (RUN_STATS_ANALYSIS) {
+  for (g in GOI) {
+    res <- IPO.Stats(g)
+    STATS[[g]] <- res$report
+    writeLines(res$report, file.path(OUTPUT_DIR, paste0("Statistics_", IPO.GeneFile(g), ".txt")))
+    if (!is.null(res$letters)) LET <- rbind(LET, res$letters)
+  }
+  if (!is.null(LET)) IPO.Export(LETTERS_OUTPUT_FILE, LET)
+}
+```
+
+### Tukey letters (all genes)
+
+Groups sharing a letter are not significantly different (alpha = `r ALPHA`). Letter "a" = highest mean.
+
+```{r letters-table, eval = RUN_STATS_ANALYSIS && !is.null(LET)}
+knitr::kable(LET, digits = 4, row.names = FALSE)
+```
+
+### Full statistics report per gene
+
+```{r stats-report, results = "asis", eval = RUN_STATS_ANALYSIS}
+for (g in GOI) {
+  cat("\n#### ", g, "\n\n```\n", paste(STATS[[g]], collapse = "\n"), "\n```\n\n", sep = "")
+}
+```
+
+## Plots
+
+```{r plot-prep}
+# Layout: one x-axis cluster per D2 group (or per sample if there is no D2);
+# samples are placed side by side within a cluster.
+cluster.levels <- if (IPO.HasDIM2) DIM2 else SMP
+ci <- match(if (IPO.HasDIM2) long$d2 else long$sample, cluster.levels)
+si <- match(long$sample, SMP)
+step <- if (IPO.HasDIM2) BOX_CLUSTER_WIDTH / SMP.num else BOX_CLUSTER_WIDTH
+box.w <- step * 0.4
+long$xpos <- ci + if (IPO.HasDIM2) (si - (SMP.num + 1) / 2) * step else 0
+long$sample <- factor(long$sample, levels = SMP)
+
+# One point per experiment x biological replicate. Shape = experiment (each
+# experiment has its own open shape). Within a box the points are placed left
+# to right: experiment 1 (bio 1, 2, ...), then experiment 2, and so on.
+combo.all <- paste(long$exp, long$bio, sep = "|")
+COMBOS <- unique(paste(Ratios$exp, Ratios$bio, sep = "|"))
+COMBOS <- COMBOS[order(match(sub("\\|.*$", "", COMBOS), EXPS), match(sub("^.*\\|", "", COMBOS), BIOS))]
+long$combo <- factor(combo.all, levels = COMBOS)
+n.combo <- length(COMBOS)
+long$xpoint <- long$xpos + ((as.integer(long$combo) - 1) / max(n.combo - 1, 1) - 0.5) * 0.6 * box.w
+long$exp.f <- factor(long$exp, levels = EXPS)
+exp.shape <- setNames(EXP_SHAPES[seq_len(EXP.num)], EXPS)
+exp.label <- paste("Experiment", EXPS)
+
+long$gene.f <- factor(long$gene, levels = GOI)
+panel.lab <- setNames(vapply(GOI, IPO.GeneTitle, ""), GOI)
+long$panel <- factor(panel.lab[long$gene], levels = unname(panel.lab))
+
+# Letter / "n.d." annotation positions
+ann <- NULL
+for (g in GOI) {
+  dg <- long[long$gene == g, ]
+  rng <- range(dg$ratio, na.rm = TRUE)
+  if (!all(is.finite(rng))) rng <- c(0, 1)
+  pad <- if (Y_AXIS_LOG2) NULL else 0.04 * diff(rng)
+  agg <- do.call(rbind, lapply(split(dg, dg$group), function(x) {
+    data.frame(gene = g, group = x$group[1], xpos = x$xpos[1], sample = x$sample[1],
+               ymax = if (all(is.na(x$ratio))) NA else max(x$ratio, na.rm = TRUE))
+  }))
+  agg$y <- if (Y_AXIS_LOG2) agg$ymax * 1.15 else agg$ymax + pad
+  agg$label <- ""
+  if (DRAW_LETTERS && !is.null(LET)) {
+    m <- LET[LET$gene == g, ]
+    agg$label <- ifelse(agg$group %in% m$group, m$letter[match(agg$group, m$group)], "")
+  }
+  nd <- is.na(agg$ymax)
+  agg$label[nd] <- NOT_DETECTED
+  agg$y[nd] <- if (Y_AXIS_LOG2) min(dg$ratio[dg$ratio > 0], na.rm = TRUE) else 0
+  ann <- rbind(ann, agg)
+}
+ann$panel <- factor(panel.lab[ann$gene], levels = unname(panel.lab))
+ann$sample <- factor(ann$sample, levels = SMP)
+
+IPO.yaxis.label <- if (REF.num == 1) REF else
+  paste(paste(REF[-REF.num], collapse = ", "), "and", REF[REF.num])
+y.title <- IPO.Joker(gsub("_", "\n", Y_AXIS_TITLE), IPO.yaxis.label)
+```
+
+```{r plot-function}
+IPO.MakePlot <- function(genes, facet = FALSE) {
+  dat <- long[long$gene %in% genes, ]
+  an <- ann[ann$gene %in% genes, ]
+  brks <- seq_along(cluster.levels)
+  p <- ggplot(dat, aes(x = xpos, y = ratio)) +
+    geom_boxplot(aes(fill = sample, group = interaction(gene.f, xpos)), width = box.w,
+                 alpha = BOX_FILL_ALPHA, colour = "grey15", linewidth = 0.5,
+                 outlier.shape = NA, na.rm = TRUE)
+  if (DRAW_ACTUAL_VALUES) {
+    p <- p + geom_point(aes(x = xpoint, shape = exp.f), size = POINT_SIZE,
+                        fill = "black", colour = "black", stroke = 0.9, na.rm = TRUE)
+  }
+  if (nrow(an) > 0) {
+    p <- p + geom_text(data = an, aes(x = xpos, y = y, label = label), vjust = 0,
+                       size = LETTER_SIZE, fontface = "bold", inherit.aes = FALSE)
+  }
+  p <- p +
+    scale_x_continuous(breaks = brks, labels = cluster.levels,
+                       limits = c(0.5, length(cluster.levels) + 0.5), expand = c(0, 0)) +
+    scale_fill_manual(values = SMP.col, name = LEGEND_TITLE_SAMPLE, drop = FALSE) +
+    scale_shape_manual(values = exp.shape, labels = exp.label,
+                       name = LEGEND_TITLE_REPEAT, drop = FALSE) +
+    labs(x = X_AXIS_TITLE, y = y.title) +
+    theme_classic(base_size = FONT_SIZE) +
+    theme(aspect.ratio = 1) +
+    theme(axis.line = element_line(linewidth = 0.8), axis.ticks = element_line(linewidth = 0.8),
+          axis.text = element_text(colour = "black"),
+          plot.title = element_text(face = "italic", hjust = 0.5),
+          strip.background = element_blank(),
+          strip.text = element_text(face = "italic", size = FONT_SIZE),
+          legend.position = if (DRAW_LEGEND) LEGEND_POS else "none") +
+    guides(fill = guide_legend(order = 1, override.aes = list(shape = NA)),
+           shape = if (EXP.num > 1) guide_legend(order = 2) else "none")
+  p <- p + (if (Y_AXIS_LOG2)
+    scale_y_continuous(transform = "log2", expand = expansion(mult = c(0.05, 0.2)))
+    else scale_y_continuous(expand = expansion(mult = c(0.02, 0.1)),
+                            limits = function(l) c(min(0, l[1]), l[2])))
+  if (facet) {
+    p <- p + facet_wrap(~ panel, ncol = MULTIPANEL_COLS,
+                        scales = if (MULTIPANEL_FREE_Y) "free_y" else "fixed")
+  } else if (PRINT_GRAPH_TITLE) {
+    p <- p + ggtitle(IPO.Joker(GRAPH_TITLE, panel.lab[genes[1]]))
+  }
+  p
+}
+
+# Size of the multi-panel plot
+ncol.panel <- min(MULTIPANEL_COLS, GOI.num)
+nrow.panel <- ceiling(GOI.num / ncol.panel)
+PANEL_FIG_W <- PANEL_WIDTH * ncol.panel + if (DRAW_LEGEND && LEGEND_POS %in% c("right", "left")) 1.8 else 0
+PANEL_FIG_H <- PANEL_HEIGHT * nrow.panel + if (DRAW_LEGEND && LEGEND_POS %in% c("top", "bottom")) 1 else 0
+```
+
+### One plot per gene
+
+```{r plots-single, eval = DRAW_SINGLE_PLOTS, fig.width = FIG_WIDTH, fig.height = FIG_HEIGHT}
+for (g in GOI) print(IPO.MakePlot(g))
+```
+
+### All genes
+
+```{r plots-multipanel, eval = DRAW_MULTIPANEL && GOI.num > 0, fig.width = PANEL_FIG_W, fig.height = PANEL_FIG_H}
+IPO.MakePlot(GOI, facet = TRUE)
+```
+
+## Save the plots
+
+```{r save-plots}
+IPO.Save <- function(p, name, w, h) {
+  ext <- switch(toupper(GRAPH_EXPORT_FORMAT), JPEG = "jpg", PNG = "png", SVG = "svg", PDF = "pdf",
+                stop("GRAPH_EXPORT_FORMAT must be JPEG, PNG, SVG or PDF"))
+  ggsave(file.path(OUTPUT_DIR, paste0(name, ".", ext)), p, width = w, height = h,
+         dpi = FIG_DPI, bg = "white")
+}
+if (DRAW_SINGLE_PLOTS) for (g in GOI) IPO.Save(IPO.MakePlot(g), IPO.GeneFile(g), FIG_WIDTH, FIG_HEIGHT)
+if (DRAW_MULTIPANEL && GOI.num > 0)
+  IPO.Save(IPO.MakePlot(GOI, facet = TRUE), "All_genes", PANEL_FIG_W, PANEL_FIG_H)
+
+cat(SCRIPT_HEADER, "Files written to:", normalizePath(OUTPUT_DIR), "\n")
+cat(paste0("  * ", list.files(OUTPUT_DIR)), sep = "\n")
+```
+
+# Session information
+
+```{r session-info}
+sessionInfo()
+```
